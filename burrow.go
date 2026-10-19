@@ -7,7 +7,7 @@ import (
 )
 
 // Option configures a client: how it trusts the Burrow (WithTLS), how it names itself in the Burrow's audit trail
-// (WithClientTag), and for Open, which identity it acts as (WithIdentity).
+// (WithClientTag), whether it keeps a cache (WithCache), and for Open, which identity it acts as (WithIdentity).
 type Option func(*settings)
 
 type settings struct {
@@ -15,6 +15,8 @@ type settings struct {
 	clientTag   string
 	identity    string
 	identitySet bool
+	// cache is WithCache's choice; nil leaves it to the identity's switch.
+	cache *bool
 }
 
 func collect(opts []Option) settings {
@@ -51,6 +53,18 @@ func WithIdentity(target string) Option {
 	}
 }
 
+// WithCache turns the cache on or off for the client. Without it, Open follows the switch `ratel cache enable` sets for
+// its identity, and the cache is off for Connect.
+//
+// With the cache on, each secret the client reads is kept, encrypted with the machine's key, in its identity's folder.
+// When GetSecret fails because the Burrow can't be reached or can't answer, the copy answers instead, and
+// Secret.CachedAt says when it was saved; a live handle keeps the value it holds instead. When the Burrow refuses a read
+// (the machine was removed or lost access, or the secret is gone), the copy is deleted. Connect needs
+// ConnectConfig.PinStoreDir for it; Enroll and OIDC keep nothing on disk and can't have one.
+func WithCache(enabled bool) Option {
+	return func(s *settings) { s.cache = &enabled }
+}
+
 // Open opens a client as a machine identity on this host: the one under ~/.burrow (or $BURROW_HOME), or the one
 // WithIdentity picks. A machine gets its identity when it's added from the Burrow's Machines page.
 //
@@ -81,7 +95,11 @@ func Open(opts ...Option) (*Client, error) {
 		mode = identityTLS(id.TLSMode)
 	}
 	auth := &signedAuthorizer{id: id.MachineID, key: key, clientTag: s.clientTag, now: time.Now}
-	return newClient(id.BurrowURL, auth, mode, id.Dir()), nil
+	c := newClient(id.BurrowURL, auth, mode, id.Dir())
+	if (s.cache == nil && cacheSwitchOn(id.Dir())) || (s.cache != nil && *s.cache) {
+		c.cache = newSecretCache(id.Dir(), id.MachineID, key.Seed())
+	}
+	return c, nil
 }
 
 // identityTLS is the trust for an identity, from the mode chosen when its machine was added: "encrypted" accepts the
@@ -130,12 +148,20 @@ func Connect(config ConnectConfig, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	cached := s.cache != nil && *s.cache
+	if cached && strings.TrimSpace(config.PinStoreDir) == "" {
+		return nil, &IdentityError{Reason: "WithCache needs ConnectConfig.PinStoreDir, the folder the cache is kept in"}
+	}
 	mode := s.tls
 	if mode.kind == tlsDefault {
 		mode = TLSPinned()
 	}
 	auth := &signedAuthorizer{id: config.MachineID, key: key, clientTag: s.clientTag, now: time.Now}
-	return newClient(config.BurrowURL, auth, mode, config.PinStoreDir), nil
+	c := newClient(config.BurrowURL, auth, mode, config.PinStoreDir)
+	if cached {
+		c.cache = newSecretCache(config.PinStoreDir, config.MachineID, key.Seed())
+	}
+	return c, nil
 }
 
 // Enroll opens a client from a machine token's code, from the Burrow's Machine tokens page, and keeps the identity in
@@ -151,6 +177,9 @@ func Enroll(code string, opts ...Option) (*Client, error) {
 }
 
 func enroll(raw string, s settings) (*Client, error) {
+	if s.cache != nil && *s.cache {
+		return nil, &IdentityError{Reason: "WithCache needs a machine identity kept on disk; an enrolled machine keeps nothing there"}
+	}
 	code, err := decodeEnrollmentCode(raw)
 	if err != nil {
 		return nil, err
@@ -187,6 +216,9 @@ func OIDC(config OIDCConfig, opts ...Option) (*Client, error) {
 	}
 	if strings.TrimSpace(config.BurrowURL) == "" {
 		return nil, &IdentityError{Reason: "OIDCConfig needs the Burrow's URL"}
+	}
+	if s.cache != nil && *s.cache {
+		return nil, &IdentityError{Reason: "WithCache needs a machine identity kept on disk; OIDC keeps no key to encrypt a cache with"}
 	}
 	audience := config.Audience
 	if audience == "" {

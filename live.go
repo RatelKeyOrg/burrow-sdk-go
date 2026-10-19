@@ -383,11 +383,8 @@ func (s *LiveSecret) load(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev := s.secret
-	if prev != nil && sameSecret(prev, next) {
-		return nil
-	}
 	s.secret = next
-	if prev != nil {
+	if prev != nil && !sameSecret(prev, next) {
 		emit(&s.liveHandle, s.onChange.snapshot(), func(fn func(next, prev *Secret)) { fn(next, prev) })
 	}
 	return nil

@@ -24,6 +24,8 @@ type Client struct {
 	tls     TLSMode
 	pinDir  string
 	watcher *watcher
+	// cache keeps a copy of each read and answers the reads the Burrow can't; nil when it's off.
+	cache *secretCache
 
 	mu        sync.RWMutex
 	transport *transport
@@ -68,7 +70,16 @@ func (c *Client) InsecureTLS(enabled bool) *Client {
 //
 // A dynamic certificate secret, such as an SSH user secret, is read with GetCertificate; GetSecret on one returns a
 // *ServerError (409) naming it.
+//
+// With the cache on (WithCache), the secret is kept, and a read the Burrow can't answer is answered from its copy, with
+// CachedAt saying when the copy was saved.
 func (c *Client) GetSecret(ctx context.Context, coordinate string) (*Secret, error) {
+	return c.getSecret(ctx, coordinate, true)
+}
+
+// getSecret reads a secret, keeping a copy with the cache on. fallback lets the copy answer a read the Burrow can't; a
+// live secret reads without it, keeping the value it holds and reading again.
+func (c *Client) getSecret(ctx context.Context, coordinate string, fallback bool) (*Secret, error) {
 	sc, err := secretCoordinate(coordinate)
 	if err != nil {
 		return nil, err
@@ -76,6 +87,9 @@ func (c *Client) GetSecret(ctx context.Context, coordinate string) (*Secret, err
 	body, err := c.signed(ctx, http.MethodGet, "secret.read", []string{sc.Project, sc.Environment, sc.Name},
 		"/v1/machine/secrets/"+encodeSegment(sc.Project)+"/"+encodeSegment(sc.Environment)+"/"+encodeSegment(sc.Name), nil)
 	if err != nil {
+		if cached := c.secretFromCache(err, sc.Project, sc.Environment, sc.Name, fallback); cached != nil {
+			return cached, nil
+		}
 		var server *ServerError
 		if errors.As(err, &server) && server.Refusal == refusedCertificateSecret {
 			return nil, &ServerError{
@@ -90,7 +104,29 @@ func (c *Client) GetSecret(ctx context.Context, coordinate string) (*Secret, err
 	if err := json.Unmarshal(body, &dto); err != nil {
 		return nil, decodeError(err)
 	}
+	if c.cache != nil {
+		c.cache.put(sc.Project, sc.Environment, sc.Name, body)
+	}
 	return dto.secret(), nil
+}
+
+// secretFromCache answers a read of project/env/NAME that failed with err from its copy, when the cache is on, fallback
+// is set, and err isn't the Burrow refusing the read. A refusal deletes the copies it refuses either way.
+func (c *Client) secretFromCache(err error, project, env, name string, fallback bool) *Secret {
+	if c.cache == nil || !c.cache.mayAnswer(err, project, env, name) || !fallback {
+		return nil
+	}
+	entry := c.cache.get(project, env, name)
+	if entry == nil {
+		return nil
+	}
+	var dto secretDTO
+	if json.Unmarshal(entry.body, &dto) != nil {
+		return nil
+	}
+	s := dto.secret()
+	s.cachedAt = entry.cachedAt
+	return s
 }
 
 // GetCertificate gets a certificate from a dynamic certificate secret, such as an SSH user secret, by its
@@ -178,7 +214,7 @@ func (c *Client) Live(ctx context.Context, coordinate string) (*LiveSecret, erro
 	if _, err := secretCoordinate(coordinate); err != nil {
 		return nil, err
 	}
-	h := newLiveSecret(coordinate, c.watcher, func(ctx context.Context) (*Secret, error) { return c.GetSecret(ctx, coordinate) })
+	h := newLiveSecret(coordinate, c.watcher, func(ctx context.Context) (*Secret, error) { return c.getSecret(ctx, coordinate, false) })
 	if err := c.follow(ctx, &h.liveHandle); err != nil {
 		return nil, err
 	}
@@ -240,24 +276,39 @@ func (c *Client) follow(ctx context.Context, h *liveHandle) error {
 	return nil
 }
 
-// readEnvironment is every secret in one environment, by name, in one signed request.
+// readEnvironment is every secret in one environment, by name, in one signed request, for a live environment. With the
+// cache on, each is kept, along with which secrets the environment held. The copies don't answer a read that fails: the
+// live environment keeps the values it holds and reads again.
 func (c *Client) readEnvironment(ctx context.Context, project, environment string) (map[string]*Secret, error) {
 	body, err := c.signed(ctx, http.MethodGet, "env.read", []string{project, environment},
 		"/v1/machine/secrets/"+encodeSegment(project)+"/"+encodeSegment(environment), nil)
 	if err != nil {
+		if c.cache != nil {
+			// A refusal deletes the copies it refuses.
+			c.cache.mayAnswer(err, project, environment, "")
+		}
 		return nil, err
 	}
 	var dto struct {
-		Values     []secretDTO `json:"values"`
-		Structured []secretDTO `json:"structured"`
+		Values     []json.RawMessage `json:"values"`
+		Structured []json.RawMessage `json:"structured"`
 	}
 	if err := json.Unmarshal(body, &dto); err != nil {
 		return nil, decodeError(err)
 	}
 	out := make(map[string]*Secret, len(dto.Values)+len(dto.Structured))
-	for _, d := range append(dto.Values, dto.Structured...) {
+	bodies := make(map[string][]byte, len(out))
+	for _, raw := range append(dto.Values, dto.Structured...) {
+		var d secretDTO
+		if err := json.Unmarshal(raw, &d); err != nil {
+			return nil, decodeError(err)
+		}
 		s := d.secret()
 		out[s.name] = s
+		bodies[s.name] = raw
+	}
+	if c.cache != nil {
+		c.cache.putEnvironment(project, environment, bodies)
 	}
 	return out, nil
 }

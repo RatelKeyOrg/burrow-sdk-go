@@ -16,6 +16,7 @@ Read secrets from a self-hosted [RatelKey](https://ratelkey.com) Burrow with a m
 - The machine's own access map (`ListProjects`, `ListSecrets`).
 - Certificate pinning, or standard CA trust (`WithTLS`).
 - Live secrets that follow every change on the Burrow (`Live`, `LiveEnvironment`).
+- An encrypted copy of each read that answers when the Burrow can't be reached (`WithCache`).
 - Certificates from a dynamic certificate secret, such as SSH logins, for a key made in memory (`GetCertificate`, `LiveCertificate`).
 - An identity enrolled in memory from a machine token's code (`Enroll`).
 - An OIDC token instead of a key (`OIDC`).
@@ -102,6 +103,34 @@ db.OnChange(func(next, prev *burrow.Secret) { pool.Reconnect(next) })
   `OnError`.
 - `client.Close()` closes every handle.
 - Needs a Burrow with live updates; an older one is refused at `Live`.
+
+## Fallback cache
+
+The fallback cache keeps a copy of each secret the client reads, and answers with it when your Burrow can't be reached.
+It's off until you turn it on:
+
+```go
+client, err := burrow.Open(burrow.WithCache(true))
+```
+
+Without `WithCache`, a client from `Open` uses the cache when `ratel cache enable` turned it on for the machine, and
+`WithCache(false)` keeps it off. With `Connect`, it needs `ConnectConfig.PinStoreDir` to keep the copies in. `Enroll`
+and `OIDC` can't use it.
+
+A read uses the cache only when it fails because your Burrow can't be reached or can't answer. A secret answered from
+the cache says when its copy was saved:
+
+```go
+key, err := client.GetSecret(ctx, "payments/prod/API_KEY")
+if !key.CachedAt().IsZero() {
+	log.Printf("using the copy saved at %s", key.CachedAt())
+}
+```
+
+A live secret or environment doesn't answer from the cache. While your Burrow can't be reached it keeps the value it
+last read, and each read it makes keeps the copies up to date. When your Burrow refuses a read, because the machine was
+removed or disabled, lost access, or the secret is gone, the read fails as usual and the refused copies are deleted. A
+dynamic secret's login comes back as it was saved, so it may have expired.
 
 ## Certificates
 

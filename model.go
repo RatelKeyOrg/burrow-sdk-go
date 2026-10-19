@@ -31,6 +31,7 @@ type Secret struct {
 	structured bool
 	fields     []SecretField
 	byName     map[string]int
+	cachedAt   time.Time
 }
 
 func newSingleSecret(name, value, typ string, version int) *Secret {
@@ -69,6 +70,10 @@ func (s *Secret) Type() string { return s.typ }
 
 // Version is a single-value secret's current version; 0 for a structured secret.
 func (s *Secret) Version() int { return s.version }
+
+// CachedAt is when the copy the secret was read from was saved, for a read the cache answered because the Burrow
+// couldn't (WithCache). It's the zero time for a read the Burrow answered.
+func (s *Secret) CachedAt() time.Time { return s.cachedAt }
 
 // ToMap is every field of a structured secret, by name.
 func (s *Secret) ToMap() (map[string]string, error) {
