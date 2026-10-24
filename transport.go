@@ -82,7 +82,8 @@ func (t *transport) tlsConfig() *tls.Config {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	switch t.mode.kind {
 	case tlsSystemTrust:
-		// Full CA and hostname verification.
+		// Full CA and hostname verification, then no chain through a compromised eMudhra intermediate.
+		cfg.VerifyConnection = refuseCompromised
 		return cfg
 	case tlsInsecure:
 		cfg.InsecureSkipVerify = true //nolint:gosec // the caller chose no verification

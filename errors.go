@@ -53,7 +53,8 @@ type ServerError struct {
 func (e *ServerError) Error() string { return "burrow: " + e.Reason }
 
 // CertificateError is a Burrow whose TLS key doesn't match the pinned one. Either the Burrow's key was created again
-// (delete the pin in known_cert and retry) or the connection is being intercepted.
+// (delete the pin in known_cert and retry) or the connection is being intercepted. Under TLSSystemTrust, it is also a
+// certificate issued through the compromised eMudhra certificate authorities (CVE-2026-91403).
 type CertificateError struct {
 	Reason string
 }

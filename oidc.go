@@ -2,6 +2,7 @@ package burrow
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -23,7 +24,28 @@ const (
 	bitbucketTokenVariable = "BITBUCKET_STEP_OIDC_TOKEN"
 )
 
-var oidcHTTP = &http.Client{Timeout: requestTimeout}
+// oidcTransport is what a token request goes out on: Go's default transport as it stands, so an application's own
+// settings for it (a proxy, say) still apply, with refuseCompromised after its certificate checks.
+func oidcTransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		base = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	t := base.Clone()
+	if t.TLSClientConfig == nil {
+		t.TLSClientConfig = &tls.Config{}
+	}
+	before := t.TLSClientConfig.VerifyConnection
+	t.TLSClientConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+		if before != nil {
+			if err := before(cs); err != nil {
+				return err
+			}
+		}
+		return refuseCompromised(cs)
+	}
+	return t
+}
 
 func isGitHub() bool {
 	return os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL") != "" && os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN") != ""
@@ -56,8 +78,8 @@ func mintOIDCToken(ctx context.Context, audience string) (string, error) {
 		"Pipelines the step needs 'oidc:' with the Burrow among its 'audiences'"}
 }
 
-// mintGitHub requests a token for audience from the GitHub Actions token service, which is publicly trusted: ordinary
-// TLS verification applies.
+// mintGitHub requests a token for audience from the GitHub Actions token service, which is publicly trusted: its
+// certificate is checked as TLSSystemTrust checks a Burrow's.
 func mintGitHub(ctx context.Context, audience string) (string, error) {
 	u, err := url.Parse(os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL"))
 	if err != nil {
@@ -74,7 +96,9 @@ func mintGitHub(ctx context.Context, audience string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN"))
 	req.Header.Set("Accept", "application/json")
-	resp, err := oidcHTTP.Do(req)
+	transport := oidcTransport()
+	defer transport.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: transport, Timeout: requestTimeout}).Do(req)
 	if err != nil {
 		cause := err
 		if urlErr, ok := err.(*url.Error); ok {
